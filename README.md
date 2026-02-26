@@ -116,6 +116,15 @@ file:stateMachine("My Artboard", "SM")  -- both by name
 | `scene:setNumber(name, value)` | boolean | Set a number input. Returns true if found. |
 | `scene:fireTrigger(name)` | boolean | Fire a trigger. Returns true if found. |
 
+**Pointer events (artboard-space coordinates):**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `scene:pointerDown(x, y)` | boolean | Send pointer down event. Returns true if state machine is active. |
+| `scene:pointerMove(x, y)` | boolean | Send pointer move event. Returns true if state machine is active. |
+| `scene:pointerUp(x, y)` | boolean | Send pointer up event. Returns true if state machine is active. |
+| `scene:screenToArtboard(sx, sy)` | number, number | Convert screen coordinates to artboard space using the last `drawFit()` transform. Returns nil if `drawFit()` hasn't been called yet. |
+
 **Update and render:**
 
 | Method | Returns | Description |
@@ -130,15 +139,38 @@ file:stateMachine("My Artboard", "SM")  -- both by name
 |--------|---------|-------------|
 | `scene:stats([w], [h])` | table | Draw command breakdown: `{total, normal, clip_incr, clip_decr, solid, linear, radial, max_clip}`. |
 
+## Pointer Events
+
+Forward Love2D mouse callbacks to the scene using `screenToArtboard()` for coordinate conversion:
+
+```lua
+function love.mousepressed(x, y, button)
+    if scene and button == 1 then
+        local ax, ay = scene:screenToArtboard(x, y)
+        if ax then scene:pointerDown(ax, ay) end
+    end
+end
+
+function love.mousemoved(x, y)
+    if scene then
+        local ax, ay = scene:screenToArtboard(x, y)
+        if ax then scene:pointerMove(ax, ay) end
+    end
+end
+
+function love.mousereleased(x, y, button)
+    if scene and button == 1 then
+        local ax, ay = scene:screenToArtboard(x, y)
+        if ax then scene:pointerUp(ax, ay) end
+    end
+end
+```
+
+`screenToArtboard()` uses the transform cached by the last `drawFit()` call. If you use `scene:draw()` directly, pass artboard-space coordinates to `pointerDown`/`pointerMove`/`pointerUp` yourself.
+
 ## Known Limitations
 
 - **macOS only** — builds a .dylib. Linux/Windows would need platform-specific builds.
-- **No image rendering** — embedded raster images in .riv files are ignored.
 - **No text rendering** — Rive text features are not supported.
-- **No pointer events** — interactive hover/click state machines need manual input wiring (see below).
 - **Maximum 16 gradient stops** per fill.
 - **0-based indices** — matching Rive/C conventions, not Lua's 1-based.
-
-### Pointer Events (Future)
-
-To support interactive Rive files that respond to mouse hover/click, you would need to add `pointerDown`/`pointerMove`/`pointerUp` C API functions that call `StateMachineInstance::pointerDown(Vec2D)` etc., then forward Love2D mouse events with coordinates converted from screen space to artboard space.

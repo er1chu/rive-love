@@ -42,6 +42,9 @@ int32_t rive_love_scene_set_number(rive_love_scene* scene,
                                     const char* name, float value);
 int32_t rive_love_scene_fire_trigger(rive_love_scene* scene,
                                       const char* name);
+int32_t rive_love_scene_pointer_down(rive_love_scene* scene, float x, float y);
+int32_t rive_love_scene_pointer_move(rive_love_scene* scene, float x, float y);
+int32_t rive_love_scene_pointer_up(rive_love_scene* scene, float x, float y);
 int32_t rive_love_scene_advance(rive_love_scene* scene, float dt);
 int32_t rive_love_scene_render(rive_love_scene* scene,
                                 float frame_width, float frame_height);
@@ -62,11 +65,24 @@ typedef struct rive_love_draw_info {
     int32_t      grad_stop_count;
     int32_t      blend_mode;
     float        opacity;
+    int32_t      image_id;
+    const float* uv_coords;
 } rive_love_draw_info;
 
 int32_t rive_love_scene_get_draw(rive_love_scene* scene,
                                   int32_t index,
                                   rive_love_draw_info* out);
+
+typedef struct rive_love_image_info {
+    int32_t width;
+    int32_t height;
+    const uint8_t* pixels;
+    int32_t data_size;
+} rive_love_image_info;
+
+int32_t rive_love_image_get(rive_love_context* ctx,
+                             int32_t image_id,
+                             rive_love_image_info* out);
 ]]
 
 -- ── Load dylib from same directory as this Lua file ──────────────────
@@ -75,6 +91,10 @@ local C = ffi.load(source .. "/rive_love.dylib")
 
 -- ── Module table ─────────────────────────────────────────────────────
 local M = {}
+
+-- ── Image cache (image_id → Love2D Image) ───────────────────────────
+local _image_cache = {}
+local _image_info = nil -- lazily allocated
 
 -- ── Gradient shader (created lazily) ─────────────────────────────────
 local _gradient_shader = nil
@@ -152,6 +172,7 @@ end
 
 function M.shutdown()
     if ctx == nil then return end
+    _image_cache = {}
     C.rive_love_shutdown(ctx)
     ctx = nil
 end
@@ -357,20 +378,68 @@ function Scene:fireTrigger(name)
     return C.rive_love_scene_fire_trigger(self._handle, name) == 0
 end
 
+-- Pointer events (coordinates in artboard space)
+function Scene:pointerDown(x, y)
+    return C.rive_love_scene_pointer_down(self._handle, x, y) == 0
+end
+function Scene:pointerMove(x, y)
+    return C.rive_love_scene_pointer_move(self._handle, x, y) == 0
+end
+function Scene:pointerUp(x, y)
+    return C.rive_love_scene_pointer_up(self._handle, x, y) == 0
+end
+
+-- Convert screen coordinates to artboard space using the last drawFit transform.
+-- Returns nil, nil if drawFit hasn't been called yet.
+function Scene:screenToArtboard(sx, sy)
+    local f = self._fit
+    if not f then return nil, nil end
+    return (sx - f.dx) / f.scale, (sy - f.dy) / f.scale
+end
+
 -- ── Mesh pool ────────────────────────────────────────────────────────
 local VERTEX_FORMAT = {
     {"VertexPosition", "float", 2},
     {"VertexColor",    "float", 4},
 }
 
-local function ensureMesh(pool, index, vc)
+local IMAGE_VERTEX_FORMAT = {
+    {"VertexPosition", "float", 2},
+    {"VertexTexCoord", "float", 2},
+    {"VertexColor",    "float", 4},
+}
+
+-- Get or create a cached Love2D Image from a decoded image ID
+local function getImage(image_id)
+    local cached = _image_cache[image_id]
+    if cached then return cached end
+
+    if not _image_info then
+        _image_info = ffi.new("rive_love_image_info")
+    end
+    if C.rive_love_image_get(ctx, image_id, _image_info) ~= 0 then
+        return nil
+    end
+
+    local w = tonumber(_image_info.width)
+    local h = tonumber(_image_info.height)
+    local size = tonumber(_image_info.data_size)
+    local imageData = love.image.newImageData(w, h, "rgba8",
+        ffi.string(_image_info.pixels, size))
+    local img = love.graphics.newImage(imageData)
+    _image_cache[image_id] = img
+    return img
+end
+
+local function ensureMesh(pool, index, vc, format)
+    format = format or VERTEX_FORMAT
     local entry = pool[index]
-    if entry and entry.cap >= vc then
+    if entry and entry.cap >= vc and entry.format == format then
         return entry.mesh
     end
     local cap = math.max(vc, 64)
-    local mesh = love.graphics.newMesh(VERTEX_FORMAT, cap, "triangles", "stream")
-    pool[index] = { mesh = mesh, cap = cap }
+    local mesh = love.graphics.newMesh(format, cap, "triangles", "stream")
+    pool[index] = { mesh = mesh, cap = cap, format = format }
     return mesh
 end
 
@@ -427,11 +496,28 @@ function Scene:draw(x, y, w, h)
             local fill_type = tonumber(info.fill_type)
             local clip_idx  = tonumber(info.clip_index)
 
-            local mesh = ensureMesh(pool, i + 1, vc)
+            local is_image = fill_type == 3
+            local mesh_fmt = is_image and IMAGE_VERTEX_FORMAT or VERTEX_FORMAT
+            local mesh = ensureMesh(pool, i + 1, vc, mesh_fmt)
 
-            -- Fill vertex positions + colors
+            -- Fill vertex positions + colors/UVs
             local verts = info.vertices
-            if fill_type == 0 then
+            if is_image then
+                -- Image: position + UV + (1,1,1,opacity)
+                local a = tonumber(info.opacity)
+                local uvs = info.uv_coords
+                for v = 0, vc - 1 do
+                    mesh:setVertex(v + 1,
+                        tonumber(verts[v*2]), tonumber(verts[v*2+1]),
+                        tonumber(uvs[v*2]), tonumber(uvs[v*2+1]),
+                        1, 1, 1, a)
+                end
+                -- Set texture
+                local img = getImage(tonumber(info.image_id))
+                if img then
+                    mesh:setTexture(img)
+                end
+            elseif fill_type == 0 then
                 -- Solid: bake fill color into vertex color
                 local r = tonumber(info.color_r)
                 local g = tonumber(info.color_g)
@@ -496,8 +582,12 @@ function Scene:draw(x, y, w, h)
                     love.graphics.setBlendMode("alpha", "alphamultiply")
                 end
 
-                -- Shader (gradient or none)
-                if fill_type ~= 0 then
+                -- Shader
+                if is_image then
+                    -- Image: use default Love2D textured rendering (premultiplied alpha)
+                    love.graphics.setShader()
+                    love.graphics.setBlendMode("alpha", "premultiplied")
+                elseif fill_type ~= 0 then
                     local shader = getGradientShader()
                     love.graphics.setShader(shader)
                     shader:send("fillType", fill_type)
@@ -557,6 +647,9 @@ function Scene:drawFit(x, y, w, h)
     local scale = math.min(w / sw, h / sh)
     local dw, dh = sw * scale, sh * scale
     local dx, dy = x + (w - dw) / 2, y + (h - dh) / 2
+
+    -- Cache transform for screenToArtboard()
+    self._fit = { dx = dx, dy = dy, scale = scale }
 
     love.graphics.push()
     love.graphics.translate(dx, dy)

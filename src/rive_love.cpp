@@ -26,6 +26,11 @@
 #include <memory>
 #include <cstring>
 #include <unordered_set>
+#include <unordered_map>
+
+// macOS image decoding
+#include <CoreGraphics/CoreGraphics.h>
+#include <ImageIO/ImageIO.h>
 
 using namespace rive;
 
@@ -59,6 +64,10 @@ struct DrawCommand
 
     int32_t blend_mode = RIVE_LOVE_BLEND_SRC_OVER;
     float opacity = 1.0f;
+
+    // Image data
+    int32_t image_id = 0;
+    std::vector<float> uv_coords; // u,v pairs per vertex
 };
 
 // ── LoveGradient ─────────────────────────────────────────────────────
@@ -89,6 +98,25 @@ public:
             colors[i * 4 + 3] = colorOpacity(rawColors[i]);
             stops[i] = rawStops[i];
         }
+    }
+};
+
+// ── LoveRenderImage ─────────────────────────────────────────────────
+
+class LoveRenderImage : public LITE_RTTI_OVERRIDE(RenderImage, LoveRenderImage)
+{
+public:
+    using Super = LITE_RTTI_OVERRIDE(RenderImage, LoveRenderImage);
+
+    int32_t m_id;
+    std::vector<uint8_t> m_pixels; // RGBA, 4 bytes per pixel
+
+    LoveRenderImage(int32_t id, int w, int h, std::vector<uint8_t> pixels)
+    {
+        m_id = id;
+        m_Width = w;
+        m_Height = h;
+        m_pixels = std::move(pixels);
     }
 };
 
@@ -486,6 +514,124 @@ private:
         m_draws.push_back(std::move(cmd));
     }
 
+    // ── Image rendering ────────────────────────────────────────────
+
+    static int32_t convertBlendMode(BlendMode bm)
+    {
+        switch (bm)
+        {
+            case BlendMode::srcOver:   return RIVE_LOVE_BLEND_SRC_OVER;
+            case BlendMode::screen:    return RIVE_LOVE_BLEND_SCREEN;
+            case BlendMode::colorDodge: return RIVE_LOVE_BLEND_ADDITIVE;
+            case BlendMode::multiply:  return RIVE_LOVE_BLEND_MULTIPLY;
+            default:                   return RIVE_LOVE_BLEND_SRC_OVER;
+        }
+    }
+
+    void drawImage(const RenderImage* image,
+                   ImageSampler,
+                   BlendMode blendMode,
+                   float opacity) override
+    {
+        LITE_RTTI_CAST_OR_RETURN(loveImage, const LoveRenderImage*, image);
+        applyClipping();
+
+        float w = (float)image->width();
+        float h = (float)image->height();
+        float totalOpacity = opacity * modulatedOpacity();
+
+        const Mat2D& xform = transform();
+
+        // Quad in image-local space: (0,0), (w,0), (w,h), (0,h)
+        Vec2D corners[4] = {
+            xform * Vec2D(0, 0),
+            xform * Vec2D(w, 0),
+            xform * Vec2D(w, h),
+            xform * Vec2D(0, h)
+        };
+
+        // UV coordinates — apply image's uvTransform
+        const Mat2D& uvXform = image->uvTransform();
+        Vec2D uvCorners[4] = {
+            uvXform * Vec2D(0, 0),
+            uvXform * Vec2D(1, 0),
+            uvXform * Vec2D(1, 1),
+            uvXform * Vec2D(0, 1)
+        };
+
+        DrawCommand cmd;
+        cmd.draw_mode = RIVE_LOVE_DRAW_NORMAL;
+        cmd.clip_index = m_clipCount;
+        cmd.fill_type = RIVE_LOVE_FILL_IMAGE;
+        cmd.image_id = loveImage->m_id;
+        cmd.blend_mode = convertBlendMode(blendMode);
+        cmd.opacity = totalOpacity;
+
+        cmd.vertices.resize(8); // 4 vertices × 2 floats
+        cmd.uv_coords.resize(8);
+        for (int i = 0; i < 4; i++)
+        {
+            cmd.vertices[i * 2 + 0] = corners[i].x;
+            cmd.vertices[i * 2 + 1] = corners[i].y;
+            cmd.uv_coords[i * 2 + 0] = uvCorners[i].x;
+            cmd.uv_coords[i * 2 + 1] = uvCorners[i].y;
+        }
+
+        // Two triangles: 0-1-2, 0-2-3
+        cmd.indices = {0, 1, 2, 0, 2, 3};
+
+        m_draws.push_back(std::move(cmd));
+    }
+
+    void drawImageMesh(const RenderImage* image,
+                       ImageSampler,
+                       rcp<RenderBuffer> vertices_f32,
+                       rcp<RenderBuffer> uvCoords_f32,
+                       rcp<RenderBuffer> indices_u16,
+                       uint32_t vertexCount,
+                       uint32_t indexCount,
+                       BlendMode blendMode,
+                       float opacity) override
+    {
+        LITE_RTTI_CAST_OR_RETURN(loveImage, const LoveRenderImage*, image);
+        LITE_RTTI_CAST_OR_RETURN(vertBuf, LoveRenderBuffer*, vertices_f32.get());
+        LITE_RTTI_CAST_OR_RETURN(uvBuf, LoveRenderBuffer*, uvCoords_f32.get());
+        LITE_RTTI_CAST_OR_RETURN(idxBuf, LoveRenderBuffer*, indices_u16.get());
+        applyClipping();
+
+        float totalOpacity = opacity * modulatedOpacity();
+        const Mat2D& xform = transform();
+
+        const float* srcVerts = reinterpret_cast<const float*>(vertBuf->data());
+        const float* srcUVs = reinterpret_cast<const float*>(uvBuf->data());
+        const uint16_t* srcIndices = reinterpret_cast<const uint16_t*>(idxBuf->data());
+
+        DrawCommand cmd;
+        cmd.draw_mode = RIVE_LOVE_DRAW_NORMAL;
+        cmd.clip_index = m_clipCount;
+        cmd.fill_type = RIVE_LOVE_FILL_IMAGE;
+        cmd.image_id = loveImage->m_id;
+        cmd.blend_mode = convertBlendMode(blendMode);
+        cmd.opacity = totalOpacity;
+
+        // Transform vertices
+        cmd.vertices.resize(vertexCount * 2);
+        for (uint32_t i = 0; i < vertexCount; i++)
+        {
+            Vec2D p = xform * Vec2D(srcVerts[i * 2], srcVerts[i * 2 + 1]);
+            cmd.vertices[i * 2 + 0] = p.x;
+            cmd.vertices[i * 2 + 1] = p.y;
+        }
+
+        // Copy UVs directly
+        cmd.uv_coords.assign(srcUVs, srcUVs + vertexCount * 2);
+
+        // Copy indices
+        cmd.indices.assign(srcIndices, srcIndices + indexCount);
+
+        m_draws.push_back(std::move(cmd));
+    }
+
     // ── Fill paint/gradient info into a DrawCommand ──────────────
 
     void fillPaintInfo(DrawCommand& cmd, LoveRenderPaint* paint,
@@ -585,10 +731,52 @@ public:
         return make_rcp<LoveRenderPaint>();
     }
 
-    rcp<RenderImage> decodeImage(Span<const uint8_t>) override
+    std::unordered_map<int32_t, LoveRenderImage*> m_imageMap;
+    int32_t m_nextImageId = 1;
+
+    rcp<RenderImage> decodeImage(Span<const uint8_t> encoded) override
     {
-        // Image rendering not yet supported
-        return nullptr;
+        // Decode using macOS CoreGraphics (supports PNG, JPEG, WebP, etc.)
+        CFDataRef cfData = CFDataCreate(nullptr, encoded.data(), encoded.size());
+        if (!cfData) return nullptr;
+
+        CGImageSourceRef source = CGImageSourceCreateWithData(cfData, nullptr);
+        CFRelease(cfData);
+        if (!source) return nullptr;
+
+        CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+        CFRelease(source);
+        if (!cgImage) return nullptr;
+
+        int w = (int)CGImageGetWidth(cgImage);
+        int h = (int)CGImageGetHeight(cgImage);
+
+        // Create RGBA bitmap context and draw into it
+        std::vector<uint8_t> pixels(w * h * 4);
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(
+            pixels.data(), w, h, 8, w * 4,
+            colorSpace,
+            kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        CGColorSpaceRelease(colorSpace);
+
+        if (!ctx)
+        {
+            CGImageRelease(cgImage);
+            return nullptr;
+        }
+
+        // Flip Y axis (CoreGraphics origin is bottom-left, we want top-left)
+        CGContextTranslateCTM(ctx, 0, h);
+        CGContextScaleCTM(ctx, 1, -1);
+        CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cgImage);
+        CGContextRelease(ctx);
+        CGImageRelease(cgImage);
+
+        int32_t id = m_nextImageId++;
+        auto img = make_rcp<LoveRenderImage>(id, w, h, std::move(pixels));
+        m_imageMap[id] = img.get();
+        return img;
     }
 };
 
@@ -890,6 +1078,33 @@ int32_t rive_love_scene_fire_trigger(rive_love_scene* scene,
 }
 
 __attribute__((visibility("default")))
+int32_t rive_love_scene_pointer_down(rive_love_scene* scene,
+                                      float x, float y)
+{
+    if (!scene || !scene->stateMachine) return -1;
+    scene->stateMachine->pointerDown(Vec2D(x, y));
+    return 0;
+}
+
+__attribute__((visibility("default")))
+int32_t rive_love_scene_pointer_move(rive_love_scene* scene,
+                                      float x, float y)
+{
+    if (!scene || !scene->stateMachine) return -1;
+    scene->stateMachine->pointerMove(Vec2D(x, y));
+    return 0;
+}
+
+__attribute__((visibility("default")))
+int32_t rive_love_scene_pointer_up(rive_love_scene* scene,
+                                    float x, float y)
+{
+    if (!scene || !scene->stateMachine) return -1;
+    scene->stateMachine->pointerUp(Vec2D(x, y));
+    return 0;
+}
+
+__attribute__((visibility("default")))
 int32_t rive_love_scene_advance(rive_love_scene* scene, float dt)
 {
     if (!scene) return 0;
@@ -974,6 +1189,28 @@ int32_t rive_love_scene_get_draw(rive_love_scene* scene,
     out->blend_mode = cmd.blend_mode;
     out->opacity = cmd.opacity;
 
+    out->image_id = cmd.image_id;
+    out->uv_coords = cmd.uv_coords.empty() ? nullptr : cmd.uv_coords.data();
+
+    return 0;
+}
+
+__attribute__((visibility("default")))
+int32_t rive_love_image_get(rive_love_context* ctx,
+                             int32_t image_id,
+                             rive_love_image_info* out)
+{
+    if (!ctx || !out) return -1;
+
+    auto* factory = static_cast<LoveFactory*>(ctx->factory.get());
+    auto it = factory->m_imageMap.find(image_id);
+    if (it == factory->m_imageMap.end()) return -1;
+
+    auto* img = it->second;
+    out->width = img->width();
+    out->height = img->height();
+    out->pixels = img->m_pixels.data();
+    out->data_size = (int32_t)img->m_pixels.size();
     return 0;
 }
 

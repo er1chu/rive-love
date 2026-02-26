@@ -51,6 +51,27 @@ function love.draw()
     love.graphics.print("FPS: " .. love.timer.getFPS(), 10, 10)
 end
 
+function love.mousepressed(x, y, button)
+    if scene and button == 1 then
+        local ax, ay = scene:screenToArtboard(x, y)
+        if ax then scene:pointerDown(ax, ay) end
+    end
+end
+
+function love.mousemoved(x, y)
+    if scene then
+        local ax, ay = scene:screenToArtboard(x, y)
+        if ax then scene:pointerMove(ax, ay) end
+    end
+end
+
+function love.mousereleased(x, y, button)
+    if scene and button == 1 then
+        local ax, ay = scene:screenToArtboard(x, y)
+        if ax then scene:pointerUp(ax, ay) end
+    end
+end
+
 function love.keypressed(key)
     if key == "q" or key == "escape" then
         love.event.quit()

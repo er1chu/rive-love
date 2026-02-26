@@ -81,6 +81,16 @@ int32_t rive_love_scene_set_number(rive_love_scene* scene,
 int32_t rive_love_scene_fire_trigger(rive_love_scene* scene,
                                       const char* name);
 
+// ── Pointer events (coordinates in artboard space) ──────────────────
+// Forward mouse/touch events to the state machine.
+// Returns 0 on success, -1 if no state machine is active.
+int32_t rive_love_scene_pointer_down(rive_love_scene* scene,
+                                      float x, float y);
+int32_t rive_love_scene_pointer_move(rive_love_scene* scene,
+                                      float x, float y);
+int32_t rive_love_scene_pointer_up(rive_love_scene* scene,
+                                    float x, float y);
+
 // ── Advance + Render ─────────────────────────────────────────────────
 // Advance the animation/state machine by dt seconds.
 // Returns 1 if still playing, 0 if animation completed.
@@ -104,6 +114,7 @@ int32_t rive_love_scene_render(rive_love_scene* scene,
 #define RIVE_LOVE_FILL_SOLID     0
 #define RIVE_LOVE_FILL_LINEAR    1
 #define RIVE_LOVE_FILL_RADIAL    2
+#define RIVE_LOVE_FILL_IMAGE     3
 
 // Blend modes
 #define RIVE_LOVE_BLEND_SRC_OVER 0
@@ -143,12 +154,31 @@ typedef struct rive_love_draw_info {
 
     // Opacity (pre-multiplied into color_a for solid, but separate for gradients)
     float opacity;
+
+    // Image (when fill_type == FILL_IMAGE)
+    int32_t      image_id;          // 0 = no image
+    const float* uv_coords;        // u,v pairs per vertex (2 floats × vertex_count)
 } rive_love_draw_info;
 
 // Get draw command at index [0, draw_count). Returns 0 on success, -1 on error.
 int32_t rive_love_scene_get_draw(rive_love_scene* scene,
                                   int32_t index,
                                   rive_love_draw_info* out);
+
+// ── Image query ─────────────────────────────────────────────────────
+// Query decoded image data for creating textures on the Lua side.
+typedef struct rive_love_image_info {
+    int32_t width;
+    int32_t height;
+    const uint8_t* pixels;      // RGBA, 4 bytes per pixel
+    int32_t data_size;           // width * height * 4
+} rive_love_image_info;
+
+// Get image pixel data by ID (from draw_info.image_id).
+// Returns 0 on success, -1 if image not found.
+int32_t rive_love_image_get(rive_love_context* ctx,
+                             int32_t image_id,
+                             rive_love_image_info* out);
 
 #ifdef __cplusplus
 }

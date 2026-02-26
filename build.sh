@@ -122,6 +122,7 @@ clang++ -arch $ARCH \
     -framework CoreText \
     -framework CoreGraphics \
     -framework CoreFoundation \
+    -framework ImageIO \
     -o "$OUT_LIB"
 
 # ── Step 5: Code sign (required on macOS 14+) ─────────────────────
