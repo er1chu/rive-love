@@ -1,9 +1,11 @@
 local rive = require("rive_love")
+local ffi = require("ffi")
 
 local file, scene
+local debug_done = false
 
 function love.load()
-    file = rive.load("fire_button.riv")
+    file = rive.load("text_test.riv")
 
     -- Enumerate artboards
     print("Artboards:")
@@ -45,6 +47,14 @@ function love.draw()
 
     if scene then
         scene:drawFit()
+    end
+
+    -- Debug: dump draw info on first frame
+    if scene and not debug_done then
+        debug_done = true
+        local s = scene:stats()
+        print(("\nDEBUG: %d draws (normal=%d clip+=%d clip-=%d)"):format(
+            s.total, s.normal, s.clip_incr, s.clip_decr))
     end
 
     love.graphics.setColor(1, 1, 1)
