@@ -1,0 +1,16 @@
+# Build artifacts
+build/
+*.dylib
+*.o
+
+# Dependencies (cloned separately)
+deps/
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
+
+# Large test assets
+example/26133-49002-studiorun-a-cosmic-game-by-thelittlelabs.riv
