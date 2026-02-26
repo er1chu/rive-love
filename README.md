@@ -171,6 +171,6 @@ end
 ## Known Limitations
 
 - **macOS only** — builds a .dylib. Linux/Windows would need platform-specific builds.
-- **No text rendering** — Rive text features are not supported.
 - **Maximum 16 gradient stops** per fill.
+- **Text strokes ignored** — text fill rendering works (gradients, solids), but stroke effects on text are skipped. CPU stroke extrusion on glyph-scale coordinates produces artifacts.
 - **0-based indices** — matching Rive/C conventions, not Lua's 1-based.
