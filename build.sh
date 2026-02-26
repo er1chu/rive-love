@@ -26,8 +26,15 @@ if [ ! -e "$RIVE/tess/premake5.lua" ]; then
 fi
 
 pushd "$RIVE/tess"
-# Override RIVE_PREMAKE_ARGS to avoid unknown flags in this premake config.
-RIVE_PREMAKE_ARGS="" bash ../build/build_rive.sh release
+# Enable text rendering (HarfBuzz font shaping + glyph-to-path conversion).
+# Clean previous build if premake args changed.
+if [ -d "out/release" ] && [ -f "out/release/.rive_premake_args" ]; then
+    if ! grep -q "with_rive_text" "out/release/.rive_premake_args" 2>/dev/null; then
+        echo "  Cleaning previous build (premake args changed)..."
+        rm -rf out/release
+    fi
+fi
+RIVE_PREMAKE_ARGS="--with_rive_text" bash ../build/build_rive.sh release
 popd
 
 # ── Step 2: Locate built artifacts ─────────────────────────────────
