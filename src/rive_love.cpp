@@ -21,6 +21,9 @@
 #include "rive/math/mat2d.hpp"
 #include "rive/math/mat4.hpp"
 
+// libtess2 for multi-contour tessellation (text glyphs)
+#include "tesselator.h"
+
 #include <vector>
 #include <string>
 #include <memory>
@@ -133,7 +136,7 @@ public:
 
     LoveRenderPath() {}
     LoveRenderPath(RawPath& rawPath, FillRule fillRule)
-        : Super(rawPath, fillRule) {}
+        : Super(rawPath, fillRule), m_loveFillRule(fillRule) {}
 
     void addTriangles(Span<const Vec2D> vts,
                       Span<const uint16_t> idx) override
@@ -152,19 +155,215 @@ public:
         m_bounds = value;
     }
 
+    void fillRule(FillRule value) override
+    {
+        TessRenderPath::fillRule(value);
+        m_loveFillRule = value;
+    }
+
+    // Override addRawPath to split multi-contour paths (e.g., text with
+    // multiple glyphs) into separate sub-paths. The base class earcut
+    // tessellation can't handle disconnected contours, but when paths
+    // are stored as sub-paths, TessRenderPath::triangulate() uses libtess2
+    // which handles them correctly.
+    void addRawPath(const RawPath& path) override
+    {
+        if (path.countMoveTos() <= 1)
+        {
+            // Single contour — earcut handles this correctly
+            TessRenderPath::addRawPath(path);
+            return;
+        }
+
+        // Multiple disconnected contours — split into sub-paths
+        RawPath currentContour;
+        bool hasGeometry = false;
+
+        auto flush = [&]()
+        {
+            if (hasGeometry)
+            {
+                auto subPath = make_rcp<LoveRenderPath>(
+                    currentContour, m_loveFillRule);
+                addRenderPath(subPath.get(), Mat2D());
+                m_ownedSubPaths.push_back(std::move(subPath));
+                currentContour.rewind();
+                hasGeometry = false;
+            }
+        };
+
+        for (auto [verb, pts] : path)
+        {
+            switch (verb)
+            {
+                case PathVerb::move:
+                    flush();
+                    currentContour.moveTo(pts[0].x, pts[0].y);
+                    break;
+                case PathVerb::line:
+                    currentContour.lineTo(pts[1].x, pts[1].y);
+                    hasGeometry = true;
+                    break;
+                case PathVerb::cubic:
+                    currentContour.cubicTo(
+                        pts[1].x, pts[1].y,
+                        pts[2].x, pts[2].y,
+                        pts[3].x, pts[3].y);
+                    hasGeometry = true;
+                    break;
+                case PathVerb::close:
+                    currentContour.close();
+                    hasGeometry = true;
+                    break;
+                case PathVerb::quad:
+                    break;
+            }
+        }
+        flush();
+    }
+
     void rewind() override
     {
         TessRenderPath::rewind();
         m_vertices.clear();
         m_indices.clear();
+        m_ownedSubPaths.clear();
     }
 
-    // Trigger tessellation and return whether data is available
+    // Fine-threshold stroke extrusion for container paths (text).
+    // The base extrudeStroke() uses 1.0 threshold which is too coarse
+    // for text in small coordinate spaces, producing blocky curves.
+    void extrudeStrokeFine(ContourStroke* stroke,
+                           StrokeJoin join,
+                           StrokeCap cap,
+                           float strokeWidth,
+                           const Mat2D& transform)
+    {
+        if (!isContainer())
+        {
+            // Non-container: use base class (threshold 1.0 is fine for shapes)
+            extrudeStroke(stroke, join, cap, strokeWidth, transform);
+            return;
+        }
+
+        // Container: iterate sub-paths with fine threshold
+        for (auto& subPath : m_subPaths)
+        {
+            auto* sub = static_cast<TessRenderPath*>(subPath.path());
+            if (sub->empty()) continue;
+
+            SegmentedContour seg(0.05f);
+            seg.contour(sub->rawPath(), subPath.transform());
+
+            // Text glyph contours are always closed shapes
+            stroke->extrude(&seg, true, join, cap, strokeWidth);
+        }
+    }
+
+    // Trigger tessellation and return whether data is available.
+    // Relies on rewind() to clear cached vertices when path changes,
+    // and on TessRenderPath's dirty flag to avoid redundant work.
     bool ensureTriangulated()
     {
-        m_vertices.clear();
-        m_indices.clear();
+        // Already triangulated and cached
+        if (!m_vertices.empty()) return true;
+
+        // For container paths (multi-contour, e.g. text glyphs), use our
+        // own tessellation with a fine threshold. The base class uses 1.0
+        // which is too coarse for text in small coordinate spaces (glyph
+        // coordinates are often only 10-100 units, making curves very blocky).
+        if (isContainer())
+        {
+            return tessellateContainer();
+        }
+
+        // Single contour — base class earcut handles this correctly
         triangulate();
+        return !m_vertices.empty() && !m_indices.empty();
+    }
+
+private:
+    FillRule m_loveFillRule = FillRule::nonZero;
+    std::vector<rcp<LoveRenderPath>> m_ownedSubPaths;
+
+    // Tessellate a container path (multiple sub-paths) using libtess2
+    // with a fine threshold for crisp text/glyph rendering.
+    bool tessellateContainer()
+    {
+        TESStesselator* tess = nullptr;
+        AABB bounds = AABB::forExpansion();
+
+        for (auto& subPath : m_subPaths)
+        {
+            auto* sub = static_cast<TessRenderPath*>(subPath.path());
+            if (sub->empty()) continue;
+
+            if (!tess)
+            {
+                tess = tessNewTess(nullptr);
+            }
+
+            // Linearize curves with a very fine threshold for crisp text.
+            // Text coordinates are often small (10-100 units), so the base
+            // class threshold of 1.0 produces very blocky curves. Using 0.05
+            // gives ~45 segments per full circle at radius 5, which looks
+            // smooth at any reasonable screen scale.
+            SegmentedContour seg(0.05f);
+            seg.contour(sub->rawPath(), subPath.transform());
+            auto pts = seg.contourPoints();
+
+            if (pts.size() >= 3)
+            {
+                tessAddContour(tess, 2, pts.data(),
+                               sizeof(float) * 2, (int)pts.size());
+                bounds.expand(seg.bounds());
+            }
+        }
+
+        if (!tess) return false;
+
+        // Use TESS_WINDING_POSITIVE: Rive's text code ensures all outer
+        // contours are clockwise (positive) via addPathClockwise(). Inner
+        // contours (holes in O, B, etc.) are counter-clockwise (negative).
+        // POSITIVE correctly fills where winding > 0 (outside holes).
+        int windingRule = (m_loveFillRule == FillRule::evenOdd)
+                              ? TESS_WINDING_ODD
+                              : TESS_WINDING_POSITIVE;
+
+        bool ok = tessTesselate(tess, windingRule,
+                                TESS_POLYGONS, 3, 2, nullptr);
+        if (ok)
+        {
+            auto verts = tessGetVertices(tess);
+            auto nverts = tessGetVertexCount(tess);
+            auto elems = tessGetElements(tess);
+            auto nelems = tessGetElementCount(tess);
+
+            // Filter out degenerate triangles (TESS_UNDEF indices)
+            std::vector<uint16_t> indices;
+            for (int i = 0; i < nelems; i++)
+            {
+                int a = elems[i * 3 + 0];
+                int b = elems[i * 3 + 1];
+                int c = elems[i * 3 + 2];
+                if (a == TESS_UNDEF || b == TESS_UNDEF || c == TESS_UNDEF)
+                    continue;
+                indices.push_back((uint16_t)a);
+                indices.push_back((uint16_t)b);
+                indices.push_back((uint16_t)c);
+            }
+
+            if (!indices.empty())
+            {
+                addTriangles(
+                    Span<const Vec2D>(
+                        reinterpret_cast<const Vec2D*>(verts), nverts),
+                    indices);
+            }
+        }
+
+        tessDeleteTess(tess);
+        setTriangulatedBounds(bounds);
         return !m_vertices.empty() && !m_indices.empty();
     }
 };
@@ -317,7 +516,15 @@ public:
 
         if (lovePaint->m_style == RenderPaintStyle::stroke)
         {
-            drawStroke(lovePath, lovePaint, world, opacity);
+            // Skip strokes on container paths (text glyphs). Text glyph
+            // contours are very small in artboard space (10-100 units),
+            // making CPU stroke extrusion produce artifacts (gaps in the
+            // triangle strip that let the fill gradient bleed through).
+            // Text fill rendering works correctly; strokes are decorative.
+            if (!lovePath->isContainer())
+            {
+                drawStroke(lovePath, lovePaint, world, opacity);
+            }
         }
         else
         {
@@ -380,8 +587,8 @@ private:
         for (auto& nextClipPath : state.clipPaths)
         {
             if (alreadyApplied.count(nextClipPath.path())) continue;
-            LITE_RTTI_CAST_OR_CONTINUE(sokolPath, LoveRenderPath*, nextClipPath.path());
-            emitClipDraw(sokolPath, nextClipPath.transform(), RIVE_LOVE_DRAW_CLIP_INCR);
+            LITE_RTTI_CAST_OR_CONTINUE(lovePath, LoveRenderPath*, nextClipPath.path());
+            emitClipDraw(lovePath, nextClipPath.transform(), RIVE_LOVE_DRAW_CLIP_INCR);
         }
 
         m_clipCount = (int)state.clipPaths.size();
@@ -445,14 +652,17 @@ private:
     {
         if (!paint->m_stroke) return;
 
-        // Extrude stroke to triangle strip
+        // Extrude stroke to triangle strip.
+        // Use fine-threshold version for container paths (text glyphs)
+        // since text coordinates are often small, making curves blocky
+        // with the default 1.0 threshold.
         paint->m_stroke->reset();
         Mat2D identity;
-        path->extrudeStroke(paint->m_stroke.get(),
-                            paint->m_strokeJoin,
-                            paint->m_strokeCap,
-                            paint->m_strokeThickness / 2.0f,
-                            identity);
+        path->extrudeStrokeFine(paint->m_stroke.get(),
+                                paint->m_strokeJoin,
+                                paint->m_strokeCap,
+                                paint->m_strokeThickness / 2.0f,
+                                identity);
 
         const auto& strip = paint->m_stroke->triangleStrip();
         if (strip.size() < 3) return;
