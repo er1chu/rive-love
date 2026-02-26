@@ -1,5 +1,7 @@
 # rive_love
 
+> **Alpha** — API may change.
+
 Rive animation runtime for Love2D (macOS). Renders .riv files using CPU tessellation via rive-runtime's TessRenderer, exposed as Love2D Mesh objects with gradient shaders and stencil clipping.
 
 ## Quick Start
